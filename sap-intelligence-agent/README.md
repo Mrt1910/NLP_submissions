@@ -118,7 +118,15 @@ sap-intelligence-agent/
 ## Running the Project
 
 ```bash
-# 0. Install dependencies (CUDA build for GPU server)
+
+# 0. Venv setup in DataLab + Install dependencies (CUDA build for GPU server)
+cd ~
+mkdir -p sap-intelligence-agent
+cd sap-intelligence-agent
+python3 -m venv venv
+source venv/bin/activate
+mkdir -p data/raw data/processed
+
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install transformers accelerate bitsandbytes
 pip install chromadb sentence-transformers pandas streamlit
