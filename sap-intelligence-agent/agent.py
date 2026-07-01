@@ -1,0 +1,664 @@
+"""
+agent.py
+--------
+The AI CEO Agent orchestrator.
+
+This file implements the explicit agent workflow required by the
+clarified project requirements:
+
+    Goal -> Plan -> Retrieve -> Analyze -> Decide -> Recommend -> Validate
+
+Rather than a single LLM call that retrieves documents and immediately
+generates a recommendation, this orchestrator breaks the process into
+separate, visible steps, each with its own clearly defined output:
+
+  1. GOAL       - the objective is stated explicitly (not implicit)
+  2. PLAN       - the LLM decides WHAT to investigate and WHICH tools to
+                  use, before any retrieval happens (planning before
+                  execution)
+  3. RETRIEVE   - for each planned sub-question, relevant documents are
+                  retrieved from ChromaDB (reuses ai_ceo_agent.py)
+  4. TOOL USE   - the tools named in the plan are actually called
+                  (tools.py) - real function calls, not LLM text,
+                  producing factual signals (sentiment, trend frequency)
+  5. ANALYZE    - a dedicated LLM call reasons over the retrieved
+                  evidence AND the tool outputs together
+  6. DECIDE     - the LLM is given multiple candidate actions and must
+                  pick ONE, explicitly stating why the others were
+                  rejected (autonomous decision-making)
+  7. RECOMMEND  - the chosen action is written up in the same
+                  structured format used elsewhere in the project
+  8. VALIDATE   - a final LLM call checks the recommendation against the
+                  original evidence and either approves it or flags it
+                  for revision
+
+Each step's output is preserved in the final result, so the dashboard
+can display the agent's reasoning process, not just its final answer.
+
+This module is intentionally an orchestrator: it does not duplicate
+ai_ceo_agent.py's retrieval/LLM-calling/parsing logic, and it does not
+duplicate tools.py's tool logic. It calls into both, in a specific
+sequence, and assembles their outputs into one AgentResult.
+
+Run this with: python agent.py
+(running it directly will execute one full agent run on an example
+goal, printing every step, for testing purposes)
+"""
+
+import ai_ceo_agent
+import tools
+
+
+# STEP 2: PLAN
+# This is a dedicated LLM call with its own prompt - the agent is not told what to retrieve, it has to figure that out from the goal.
+
+def build_plan_prompt(goal):
+    prompt = f"""You are a Strategic Intelligence Agent. Before taking any action,
+you must first PLAN your approach.
+
+GOAL: {goal}
+
+Decide on 2-3 specific sub-questions you should investigate to achieve
+this goal, and which tools (if any) would help your analysis.
+
+Available tools:
+- "sentiment_tool": analyzes whether the relevant news/discussion is positive or negative
+- "trend_tool": counts how often key business/strategy terms appear in the evidence
+
+Respond with ONLY a JSON object, and nothing else, using exactly this structure:
+
+{{
+  "sub_questions": [
+    "First specific sub-question to investigate",
+    "Second specific sub-question to investigate"
+  ],
+  "tools_to_use": ["sentiment_tool", "trend_tool"]
+}}
+
+Rules:
+- "sub_questions" must contain 2-3 specific, searchable questions related to the goal
+- "tools_to_use" must be a list containing zero or more of: "sentiment_tool", "trend_tool"
+- Do not include any text outside the JSON object
+"""
+    return prompt
+
+
+def plan_step(goal):
+    """
+    STEP 2: PLAN. Asks the LLM to break the goal into sub-questions and
+    decide which tools to use, before any retrieval happens.
+    """
+    prompt = build_plan_prompt(goal)
+    raw_response = ai_ceo_agent.call_llm(prompt)
+    parsed = ai_ceo_agent.parse_llm_response(raw_response)
+
+    if parsed is None:
+        # Fallback plan if the LLM's plan couldn't be parsed - this keeps
+        # the agent running rather than failing the whole pipeline on a
+        # single bad LLM response.
+        parsed = {
+            "sub_questions": [goal],
+            "tools_to_use": ["sentiment_tool", "trend_tool"],
+        }
+
+    return parsed
+
+
+# STEP 3 + 4: RETRIEVE + TOOL USE
+
+def retrieve_step(sub_questions):
+    """
+    STEP 3: RETRIEVE. Runs ai_ceo_agent.retrieve_relevant_documents() for
+    each sub-question from the plan, and combines the results into one
+    evidence set (removing exact duplicate documents by link).
+    """
+    all_documents = []
+    seen_links = set()
+
+    for question in sub_questions:
+        documents = ai_ceo_agent.retrieve_relevant_documents(question, n_results=6)
+        for doc in documents:
+            if doc["link"] not in seen_links:
+                seen_links.add(doc["link"])
+                all_documents.append(doc)
+
+    return all_documents
+
+
+def tool_use_step(tools_to_use, documents):
+    """
+    STEP 4: TOOL USE. Actually calls the tools named in the plan,
+    against the retrieved evidence. These are real function calls
+    (tools.py) - not text generated by the LLM.
+    """
+    tool_results = []
+    for tool_name in tools_to_use:
+        result = tools.run_tool(tool_name, documents)
+        if result is not None:
+            tool_results.append(result)
+    return tool_results
+
+
+# STEP 5: ANALYZE
+
+def build_analysis_prompt(goal, documents, tool_results):
+    context_lines = []
+    for i, doc in enumerate(documents, 1):
+        context_lines.append(f"Document {i} [{doc['source_type']}]: {doc['text']}")
+    context_text = "\n".join(context_lines)
+
+    tool_lines = []
+    for result in tool_results:
+        tool_lines.append(f"- {result['tool']} output: {result}")
+    tool_text = "\n".join(tool_lines) if tool_lines else "(no tools were used)"
+
+    prompt = f"""You are a Strategic Intelligence Agent. You are analyzing evidence
+to achieve this goal: {goal}
+
+RETRIEVED EVIDENCE:
+{context_text}
+
+TOOL OUTPUTS (factual signals, not opinions):
+{tool_text}
+
+Analyze this evidence and tool output. Respond with ONLY a JSON object,
+using exactly this structure:
+
+{{
+  "key_findings": [
+    "A specific finding, referencing a document number or tool output",
+    "A second specific finding"
+  ],
+  "overall_assessment": "A 1-2 sentence summary of the situation based on the evidence and tools above"
+}}
+
+Do not include any text outside the JSON object.
+"""
+    return prompt
+
+
+def analyze_step(goal, documents, tool_results):
+    """
+    STEP 5: ANALYZE. A dedicated LLM call that reasons over BOTH the
+    retrieved evidence and the tool outputs together - kept separate
+    from the final recommendation step so the analysis itself is
+    visible and inspectable.
+    """
+    prompt = build_analysis_prompt(goal, documents, tool_results)
+    raw_response = ai_ceo_agent.call_llm(prompt)
+    parsed = ai_ceo_agent.parse_llm_response(raw_response)
+
+    if parsed is None:
+        parsed = {
+            "key_findings": [],
+            "overall_assessment": "Analysis could not be generated.",
+        }
+
+    return parsed
+
+# STEP 6: DECIDE
+#
+# The agent is explicitly given multiple candidate actions and must
+# pick ONE, stating why the others were rejected. This is the
+# "autonomous decision-making" requirement made visible: a real choice
+# between named alternatives, not just a single generated answer.
+
+def build_decision_prompt(goal, analysis):
+    findings_text = "\n".join(f"- {f}" for f in analysis.get("key_findings", []))
+
+    prompt = f"""You are a Strategic Intelligence Agent making a decision for SAP.
+
+GOAL: {goal}
+
+ANALYSIS:
+{findings_text}
+Overall assessment: {analysis.get('overall_assessment', '')}
+
+You must choose exactly ONE of these three candidate actions:
+1. "act_now" - take immediate strategic action based on the evidence
+2. "monitor" - the situation is not yet urgent; continue monitoring before acting
+3. "investigate_further" - the evidence is insufficient or unclear; more investigation is needed before deciding
+
+Respond with ONLY a JSON object, using exactly this structure:
+
+{{
+  "decision": "act_now",
+  "reasoning": "Why this option was chosen",
+  "rejected_alternatives": "A brief note on why the other two options were not chosen"
+}}
+
+"decision" must be exactly one of: "act_now", "monitor", "investigate_further"
+Do not include any text outside the JSON object.
+"""
+    return prompt
+
+
+def decide_step(goal, analysis):
+    """
+    STEP 6: DECIDE. Forces an explicit choice among named alternatives,
+    with stated reasoning for the rejected options.
+    """
+    prompt = build_decision_prompt(goal, analysis)
+    raw_response = ai_ceo_agent.call_llm(prompt)
+    parsed = ai_ceo_agent.parse_llm_response(raw_response)
+
+    if parsed is None:
+        parsed = {
+            "decision": "investigate_further",
+            "reasoning": "Decision could not be generated; defaulting to further investigation.",
+            "rejected_alternatives": "",
+        }
+
+    return parsed
+
+
+# MONITOR PATH (taken only when decide_step returns "monitor")
+#
+# This path is lighter than the act_now path: it does NOT call recommend_step or validate_step at all. There is nothing to
+# validate, because the agent has decided no action is being recommended yet.
+def build_monitoring_brief_prompt(goal, analysis, decision):
+    findings_text = "\n".join(f"- {f}" for f in analysis.get("key_findings", []))
+
+    prompt = f"""You are a Strategic Intelligence Agent. You have decided NOT to take
+immediate action on this goal, and are instead recommending continued
+monitoring.
+
+GOAL: {goal}
+KEY FINDINGS:
+{findings_text}
+REASONING FOR MONITORING: {decision.get('reasoning')}
+
+Write a short monitoring brief. Respond with ONLY a JSON object, using
+exactly this structure:
+
+{{
+  "watch_items": ["A specific thing to keep monitoring", "A second thing to monitor"],
+  "trigger_condition": "What would need to change for this to become urgent enough to act on"
+}}
+
+Do not include any text outside the JSON object.
+"""
+    return prompt
+
+
+def monitoring_brief_step(goal, analysis, decision):
+    """
+    Produces a lightweight monitoring brief instead of a full
+    recommendation. Used only when decide_step chooses "monitor".
+    """
+    prompt = build_monitoring_brief_prompt(goal, analysis, decision)
+    raw_response = ai_ceo_agent.call_llm(prompt)
+    parsed = ai_ceo_agent.parse_llm_response(raw_response)
+
+    if parsed is None:
+        parsed = {
+            "watch_items": [],
+            "trigger_condition": "Monitoring brief could not be generated.",
+        }
+
+    return parsed
+
+
+# INVESTIGATE FURTHER PATH (taken only when decide_step returns
+# "investigate_further")
+#
+# This path is heavier than the act_now path: it triggers
+# an extra retrieval round with a new, more targeted sub-question (the LLM decides what to look into further), then re-runs analysis on the
+# expanded evidence before finally proceeding to a recommendation. This is a real extra loop, not a shortcut - genuinely more LLM calls and
+# more retrieval down this specific path.
+
+def build_followup_question_prompt(goal, analysis):
+    findings_text = "\n".join(f"- {f}" for f in analysis.get("key_findings", []))
+
+    prompt = f"""You are a Strategic Intelligence Agent. You have decided the current
+evidence is insufficient to act on confidently, and need to investigate
+further before deciding.
+
+GOAL: {goal}
+CURRENT KEY FINDINGS:
+{findings_text}
+
+What ONE additional, more specific question should be investigated to
+resolve the uncertainty? Respond with ONLY a JSON object, using exactly
+this structure:
+
+{{
+  "followup_question": "A specific, narrower question to investigate next"
+}}
+
+Do not include any text outside the JSON object.
+"""
+    return prompt
+
+
+def followup_question_step(goal, analysis):
+    """
+    Asks the LLM to generate ONE targeted follow-up question, used to
+    drive a second retrieval round when the agent decided to
+    investigate further rather than act immediately.
+    """
+    prompt = build_followup_question_prompt(goal, analysis)
+    raw_response = ai_ceo_agent.call_llm(prompt)
+    parsed = ai_ceo_agent.parse_llm_response(raw_response)
+
+    if parsed is None or not parsed.get("followup_question"):
+        # Fallback: re-use the original goal as the follow-up question
+        # rather than failing the investigate-further path entirely.
+        return goal
+
+    return parsed["followup_question"]
+
+
+# STEP 7: RECOMMEND
+#
+# Reuses ai_ceo_agent's existing structured recommendation format, but now informed by the analysis and decision steps that came before it
+# rather than being generated directly from raw retrieval alone.
+
+
+def build_recommendation_prompt(goal, analysis, decision, rejection_feedback=None):
+    findings_text = "\n".join(f"- {f}" for f in analysis.get("key_findings", []))
+
+    feedback_block = ""
+    if rejection_feedback:
+        feedback_block = f"""
+IMPORTANT: a previous recommendation attempt was REJECTED during validation
+for this reason: "{rejection_feedback}"
+Write a NEW recommendation that directly addresses this feedback - either
+by choosing a different action that is more clearly grounded in the
+evidence, or by stating the recommendation more precisely so it doesn't
+overreach beyond what the evidence supports.
+"""
+
+    prompt = f"""You are a Strategic Intelligence Agent writing a final recommendation for SAP.
+
+GOAL: {goal}
+KEY FINDINGS:
+{findings_text}
+DECISION MADE: {decision.get('decision')} ({decision.get('reasoning')})
+{feedback_block}
+Write the final recommendation. Respond with ONLY a JSON object, using
+exactly this structure:
+
+{{
+  "recommendation": "A single, specific, actionable recommendation sentence",
+  "priority": "High",
+  "supporting_evidence": ["evidence point 1", "evidence point 2"],
+  "expected_impact": "Expected business impact",
+  "risk_level": "Medium"
+}}
+
+"priority" and "risk_level" must each be exactly one of: "High", "Medium", "Low"
+Do not include any text outside the JSON object.
+"""
+    return prompt
+
+
+def recommend_step(goal, analysis, decision, rejection_feedback=None):
+    """
+    STEP 7: RECOMMEND. Produces the same structured shape used
+    elsewhere in the project, but now grounded in the prior analysis
+    and decision steps. If rejection_feedback is provided (from a
+    previous failed validation attempt), the prompt explicitly asks the
+    LLM to address that specific feedback - this is what makes a retry
+    a genuine SECOND ATTEMPT rather than just running the same prompt
+    twice and hoping for a different random result.
+    """
+    prompt = build_recommendation_prompt(goal, analysis, decision, rejection_feedback)
+    raw_response = ai_ceo_agent.call_llm(prompt)
+    parsed = ai_ceo_agent.parse_llm_response(raw_response)
+
+    if parsed is None:
+        parsed = {
+            "recommendation": "Could not be generated.",
+            "priority": "Medium",
+            "supporting_evidence": [],
+            "expected_impact": "",
+            "risk_level": "Medium",
+        }
+
+    return parsed
+
+
+# STEP 8: VALIDATE
+#
+# A separate LLM call reviews the recommendation against the ORIGINAL evidence, independent of the reasoning that produced it. This catches
+# cases where a recommendation drifts from what the evidence actually supports, before it is shown to the user.
+
+def build_validation_prompt(documents, recommendation):
+    context_lines = []
+    for i, doc in enumerate(documents, 1):
+        context_lines.append(f"Document {i} [{doc['source_type']}]: {doc['text']}")
+    context_text = "\n".join(context_lines)
+
+    prompt = f"""You are a Strategic Intelligence Agent acting as a quality reviewer.
+Check whether the following recommendation is a REASONABLE STRATEGIC
+INFERENCE from the evidence below.
+
+IMPORTANT: a good strategic recommendation is a JUDGMENT CALL built from
+evidence - it will almost never be a literal, word-for-word restatement
+of something a document says. Do NOT reject a recommendation just
+because no single document explicitly states the recommended action.
+APPROVE the recommendation if:
+  - the evidence supports the GENERAL DIRECTION of the recommendation
+    (e.g. evidence of cloud growth reasonably supports a recommendation
+    to invest further in cloud), even if the exact action isn't spelled
+    out verbatim anywhere
+  - the recommendation does not contradict or ignore the evidence
+REJECT the recommendation only if:
+  - it directly contradicts what the evidence shows, or
+  - it relies on a claim with NO supporting evidence at all (not even
+    indirectly), or
+  - the evidence is so thin or irrelevant that any recommendation would
+    be a guess
+
+EVIDENCE:
+{context_text}
+
+RECOMMENDATION TO REVIEW: {recommendation.get('recommendation')}
+SUPPORTING EVIDENCE CLAIMED: {recommendation.get('supporting_evidence')}
+
+Respond with ONLY a JSON object, using exactly this structure:
+
+{{
+  "approved": true,
+  "validation_notes": "A short note explaining why this was approved or rejected"
+}}
+
+"approved" must be a boolean (true or false).
+Do not include any text outside the JSON object.
+"""
+    return prompt
+
+
+def validate_step(documents, recommendation):
+    """
+    STEP 8: VALIDATE. Reviews the recommendation against the original
+    evidence independently, and returns an approval flag plus notes.
+    """
+    prompt = build_validation_prompt(documents, recommendation)
+    raw_response = ai_ceo_agent.call_llm(prompt)
+    parsed = ai_ceo_agent.parse_llm_response(raw_response)
+
+    if parsed is None:
+        # If validation itself fails to parse, default to NOT approved -
+        # safer to flag for human review than to silently pass through
+        # an unvalidated recommendation.
+        parsed = {
+            "approved": False,
+            "validation_notes": "Validation step could not be completed.",
+        }
+
+    return parsed
+
+
+# FULL AGENT LOOP
+
+def run_agent(goal):
+    """
+    Runs the full Goal -> Plan -> Retrieve -> Tool Use -> Analyze ->
+    Decide -> [branch] workflow for a given goal.
+
+    IMPORTANT: what happens AFTER the Decide step is not a fixed
+    sequence - it genuinely depends on which of the three decision
+    options was chosen:
+
+      - "act_now": proceeds to Recommend -> Validate (with retry-on-
+        rejection).
+      - "monitor": SKIPS Recommend and Validate entirely. Produces a
+        lightweight monitoring brief instead - fewer LLM calls down
+        this path, because there is nothing to recommend or validate
+        yet.
+      - "investigate_further": triggers an EXTRA retrieval round driven
+        by a new, more targeted follow-up question, re-runs Analyze on
+        the expanded evidence, then proceeds to Recommend -> Validate
+        on the improved evidence base - more LLM calls and an extra
+        loop down this path.
+
+    This is what makes the control flow genuinely dynamic rather than a
+    fixed pipeline that always executes the same functions regardless
+    of outcome.
+    """
+    result = {"goal": goal}
+
+    # STEP 2: PLAN
+    plan = plan_step(goal)
+    result["plan"] = plan
+
+    # STEP 3: RETRIEVE
+    documents = retrieve_step(plan.get("sub_questions", [goal]))
+    result["documents"] = documents
+
+    # STEP 4: TOOL USE
+    tool_results = tool_use_step(plan.get("tools_to_use", []), documents)
+    result["tool_results"] = tool_results
+
+    # STEP 5: ANALYZE
+    analysis = analyze_step(goal, documents, tool_results)
+    result["analysis"] = analysis
+
+    # STEP 6: DECIDE
+    decision = decide_step(goal, analysis)
+    result["decision"] = decision
+
+    chosen_action = decision.get("decision")
+    result["path_taken"] = chosen_action
+
+    # PATH 1: "monitor" - lightweight path, no recommendation generated
+    if chosen_action == "monitor":
+        monitoring_brief = monitoring_brief_step(goal, analysis, decision)
+        result["monitoring_brief"] = monitoring_brief
+        result["recommendation"] = None
+        result["validation"] = None
+        result["retried"] = False
+        return result
+
+
+    # PATH 2: "investigate_further" - extra retrieval + re-analysis loop
+    # BEFORE proceeding to recommend/validate, on the expanded evidence.
+
+    if chosen_action == "investigate_further":
+        followup_question = followup_question_step(goal, analysis)
+        result["followup_question"] = followup_question
+
+        additional_documents = retrieve_step([followup_question])
+
+        # Merge with the original evidence, removing duplicates by link.
+        seen_links = {doc["link"] for doc in documents}
+        for doc in additional_documents:
+            if doc["link"] not in seen_links:
+                seen_links.add(doc["link"])
+                documents.append(doc)
+        result["documents"] = documents
+
+        # Re-run tool use and analysis on the expanded evidence
+        tool_results = tool_use_step(plan.get("tools_to_use", []), documents)
+        result["tool_results"] = tool_results
+        analysis = analyze_step(goal, documents, tool_results)
+        result["analysis"] = analysis
+
+
+    # PATH 3: "act_now" (and "investigate_further" falls through here
+    # after its extra loop above) - proceed to Recommend -> Validate.
+
+    recommendation = recommend_step(goal, analysis, decision)
+    result["recommendation"] = recommendation
+
+    validation = validate_step(documents, recommendation)
+    result["validation"] = validation
+
+    # CONDITIONAL SUB-BRANCH: retry once if validation rejects, informed by the specific rejection reason
+    result["retried"] = False
+
+    if not validation.get("approved", False):
+        rejection_feedback = validation.get("validation_notes", "")
+
+        retried_recommendation = recommend_step(goal, analysis, decision, rejection_feedback)
+        retried_validation = validate_step(documents, retried_recommendation)
+
+        result["retried"] = True
+        result["original_recommendation"] = recommendation
+        result["original_validation"] = validation
+
+        result["recommendation"] = retried_recommendation
+        result["validation"] = retried_validation
+
+    return result
+
+
+# TEST: running this file directly executes one full agent run
+
+if __name__ == "__main__":
+    example_goal = "Identify the most urgent strategic action SAP should take this quarter"
+
+    print("=" * 70)
+    print(f"GOAL: {example_goal}")
+    print("=" * 70)
+
+    result = run_agent(example_goal)
+
+    print("\n--- PLAN ---")
+    print("Sub-questions:", result["plan"].get("sub_questions"))
+    print("Tools to use:", result["plan"].get("tools_to_use"))
+
+    print(f"\n--- RETRIEVED {len(result['documents'])} DOCUMENTS ---")
+
+    print("\n--- TOOL RESULTS ---")
+    for tool_result in result["tool_results"]:
+        print(tool_result)
+
+    print("\n--- ANALYSIS ---")
+    print("Key findings:", result["analysis"].get("key_findings"))
+    print("Overall assessment:", result["analysis"].get("overall_assessment"))
+
+    print("\n--- DECISION ---")
+    print("Decision:", result["decision"].get("decision"))
+    print("Reasoning:", result["decision"].get("reasoning"))
+    print("Rejected alternatives:", result["decision"].get("rejected_alternatives"))
+
+    # The three decision paths produce DIFFERENT result shapes, so the printing logic below paths on result["path_taken"] rather than
+    # assuming recommendation/validation always exist.
+    path_taken = result.get("path_taken")
+    print(f"\n--- PATH TAKEN: {path_taken} ---")
+
+    if path_taken == "monitor":
+        brief = result.get("monitoring_brief", {})
+        print("Watch items:", brief.get("watch_items"))
+        print("Trigger condition:", brief.get("trigger_condition"))
+        print("(No recommendation or validation was generated on this path.)")
+
+    else:
+        if path_taken == "investigate_further":
+            print("Follow-up question investigated:", result.get("followup_question"))
+            print(f"Expanded evidence set to {len(result['documents'])} documents")
+
+        print("\n--- RECOMMENDATION ---")
+        print(result["recommendation"])
+
+        print("\n--- VALIDATION ---")
+        print("Approved:", result["validation"].get("approved"))
+        print("Notes:", result["validation"].get("validation_notes"))
+
+        if result.get("retried"):
+            print("\n(Note: validation rejected the first attempt; this is the retried result.)")
+            print("Original recommendation:", result["original_recommendation"].get("recommendation"))
+            print("Original rejection reason:", result["original_validation"].get("validation_notes"))
